@@ -10,7 +10,7 @@ use futures::Future;
 use gpui_util::ResultExt;
 use image::{
     AnimationDecoder, DynamicImage, Frame, ImageError, ImageFormat, Rgba,
-    codecs::{gif::GifDecoder, webp::WebPDecoder},
+    codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder},
 };
 use scheduler::Instant;
 use smallvec::SmallVec;
@@ -710,6 +710,47 @@ impl Asset for ImageAssetLoader {
                             if frames.is_empty() {
                                 return Err(ImageCacheError::Other(Arc::new(anyhow::anyhow!(
                                     "WebP could not be decoded: all frames failed ({source:?})"
+                                ))));
+                            }
+
+                            frames
+                        } else {
+                            let mut data = DynamicImage::from_decoder(decoder)?.into_rgba8();
+
+                            // Convert from RGBA to BGRA.
+                            for pixel in data.chunks_exact_mut(4) {
+                                pixel.swap(0, 2);
+                            }
+
+                            SmallVec::from_elem(Frame::new(data), 1)
+                        }
+                    }
+                    ImageFormat::Png => {
+                        let decoder = PngDecoder::new(Cursor::new(&bytes))?;
+
+                        if decoder.is_apng()? {
+                            let mut frames = SmallVec::new();
+
+                            for frame in decoder.apng()?.into_frames() {
+                                match frame {
+                                    Ok(mut frame) => {
+                                        // Convert from RGBA to BGRA.
+                                        for pixel in frame.buffer_mut().chunks_exact_mut(4) {
+                                            pixel.swap(0, 2);
+                                        }
+                                        frames.push(frame);
+                                    }
+                                    Err(err) => {
+                                        log::debug!(
+                                            "Skipping APNG frame in {source:?} due to decode error: {err}"
+                                        );
+                                    }
+                                }
+                            }
+
+                            if frames.is_empty() {
+                                return Err(ImageCacheError::Other(Arc::new(anyhow::anyhow!(
+                                    "APNG could not be decoded: all frames failed ({source:?})"
                                 ))));
                             }
 
