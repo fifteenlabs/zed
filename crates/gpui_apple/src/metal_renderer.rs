@@ -15,8 +15,9 @@ use image::RgbaImage;
 
 use core_foundation::base::TCFType;
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    metal_texture::CVMetalTextureGetTexture,
+    metal_texture_cache::CVMetalTextureCache,
+    pixel_buffer::{kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange},
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
@@ -126,6 +127,7 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    bgra_surfaces_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -323,6 +325,19 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        // BGRA surfaces carry premultiplied alpha (they come from GPU
+        // renderers like vello, and CoreGraphics can only produce
+        // premultiplied BGRA), so blend with source factor One — the
+        // path-sprite builder's blend config — rather than gpui's usual
+        // straight-alpha SourceAlpha factor.
+        let bgra_surfaces_pipeline_state = build_path_sprite_pipeline_state(
+            &device,
+            &library,
+            "bgra_surfaces",
+            "surface_vertex",
+            "surface_bgra_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -345,6 +360,7 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            bgra_surfaces_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -1127,7 +1143,6 @@ impl MetalRenderer {
             return;
         }
 
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
         command_encoder.set_vertex_buffer(
             SurfaceInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -1150,48 +1165,109 @@ impl MetalRenderer {
                 DevicePixels::from(surface.image_buffer.get_height() as i32),
             );
 
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
-
-            let y_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
-                    0,
-                )
-                .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
-                    1,
-                )
-                .unwrap();
+            // The CVMetalTexture wrappers must outlive the draw call below:
+            // the encoder retains the MTLTextures they expose, and dropping
+            // the wrappers at the end of the iteration matches the lifetime
+            // the pre-existing video path has always used (the CV texture
+            // cache nominally wants wrappers held until GPU completion, but
+            // encoder retention has proven sufficient in practice).
+            let (_texture_a, _texture_b);
+            match surface.image_buffer.get_pixel_format() {
+                format if format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange => {
+                    command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+                    let y_texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            surface.image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::R8Unorm,
+                            surface.image_buffer.get_width_of_plane(0),
+                            surface.image_buffer.get_height_of_plane(0),
+                            0,
+                        )
+                        .unwrap();
+                    let cb_cr_texture = self
+                        .core_video_texture_cache
+                        .create_texture_from_image(
+                            surface.image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::RG8Unorm,
+                            surface.image_buffer.get_width_of_plane(1),
+                            surface.image_buffer.get_height_of_plane(1),
+                            1,
+                        )
+                        .unwrap();
+                    // SAFETY: `y_texture` is a live CVMetalTexture (created
+                    // above and kept alive past the draw via `_texture_a`),
+                    // so `CVMetalTextureGetTexture` returns a valid, non-null
+                    // MTLTexture that the borrowed `TextureRef` points at.
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::YTexture as u64,
+                        unsafe {
+                            let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
+                            Some(metal::TextureRef::from_ptr(texture as *mut _))
+                        },
+                    );
+                    // SAFETY: as above, for `cb_cr_texture` / `_texture_b`.
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::CbCrTexture as u64,
+                        unsafe {
+                            let texture =
+                                CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
+                            Some(metal::TextureRef::from_ptr(texture as *mut _))
+                        },
+                    );
+                    (_texture_a, _texture_b) = (Some(y_texture), Some(cb_cr_texture));
+                }
+                format if format == kCVPixelFormatType_32BGRA => {
+                    command_encoder.set_render_pipeline_state(&self.bgra_surfaces_pipeline_state);
+                    // Unlike the video path above (whose AVFoundation buffers
+                    // are always cache-compatible), BGRA buffers come from
+                    // app code — skip the draw instead of panicking the
+                    // frame loop if the texture cache rejects one.
+                    let bgra_texture =
+                        match self.core_video_texture_cache.create_texture_from_image(
+                            surface.image_buffer.as_concrete_TypeRef(),
+                            None,
+                            MTLPixelFormat::BGRA8Unorm,
+                            surface.image_buffer.get_width(),
+                            surface.image_buffer.get_height(),
+                            0,
+                        ) {
+                            Ok(texture) => texture,
+                            Err(status) => {
+                                log::error!(
+                                    "failed to create Metal texture for BGRA surface \
+                                 (CVReturn {status}); skipping draw"
+                                );
+                                continue;
+                            }
+                        };
+                    // SAFETY: `bgra_texture` is a live CVMetalTexture (created
+                    // above and kept alive past the draw via `_texture_a`),
+                    // so `CVMetalTextureGetTexture` returns a valid, non-null
+                    // MTLTexture that the borrowed `TextureRef` points at.
+                    command_encoder.set_fragment_texture(
+                        SurfaceInputIndex::YTexture as u64,
+                        unsafe {
+                            let texture =
+                                CVMetalTextureGetTexture(bgra_texture.as_concrete_TypeRef());
+                            Some(metal::TextureRef::from_ptr(texture as *mut _))
+                        },
+                    );
+                    (_texture_a, _texture_b) = (Some(bgra_texture), None);
+                }
+                format => {
+                    log::error!("unsupported surface pixel format: {format:#x}; skipping draw");
+                    continue;
+                }
+            }
 
             command_encoder.set_vertex_bytes(
                 SurfaceInputIndex::TextureSize as u64,
                 mem::size_of_val(&texture_size) as u64,
                 &texture_size as *const Size<DevicePixels> as *const _,
             );
-            // let y_texture = y_texture.get_texture().unwrap().
-            command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
-            command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
-                Some(metal::TextureRef::from_ptr(texture as *mut _))
-            });
 
             command_encoder.draw_primitives_instanced_base_instance(
                 metal::MTLPrimitiveType::Triangle,
