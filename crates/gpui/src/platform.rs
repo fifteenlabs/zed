@@ -2113,6 +2113,15 @@ pub struct WindowOptions {
 
     /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
     pub tabbing_identifier: Option<String>,
+
+    /// Whether the platform should draw a drop shadow around the window.
+    /// Defaults to `true`. (macOS only.)
+    ///
+    /// The shadow follows the window's frame, so a window whose content
+    /// doesn't fill it — a transparent window laying out floating cards, say —
+    /// gets a shadow around the empty space too. Turn it off and let the
+    /// content draw its own.
+    pub shadow: bool,
 }
 
 /// The variables that can be configured when creating a new window
@@ -2178,6 +2187,12 @@ pub struct WindowParams {
 
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
+
+    #[cfg_attr(
+        any(target_os = "linux", target_os = "freebsd", target_os = "windows"),
+        allow(dead_code)
+    )]
+    pub shadow: bool,
 }
 
 /// Represents the status of how a window should be opened.
@@ -2239,6 +2254,7 @@ impl Default for WindowOptions {
             window_min_size: None,
             window_decorations: None,
             tabbing_identifier: None,
+            shadow: true,
         }
     }
 }
