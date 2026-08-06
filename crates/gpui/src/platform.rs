@@ -1138,6 +1138,17 @@ impl From<TileId> for etagere::AllocId {
     }
 }
 
+/// Laid-out bounds, in the units the platform expects back.
+///
+/// Both places an input handler's geometry leaves for the OS — the IME
+/// candidate rectangle and the selection rectangle — have to undo the zoom,
+/// because the platform positions those windows in its own coordinates and
+/// knows nothing about it.
+fn to_screen(mut bounds: Bounds<Pixels>, zoom: f32) -> Bounds<Pixels> {
+    bounds *= zoom;
+    bounds
+}
+
 #[expect(missing_docs)]
 pub struct PlatformInputHandler {
     cx: AsyncWindowContext,
@@ -1230,7 +1241,12 @@ impl PlatformInputHandler {
 
     pub fn bounds_for_range(&mut self, range_utf16: Range<usize>) -> Option<Bounds<Pixels>> {
         self.cx
-            .update(|window, cx| self.handler.bounds_for_range(range_utf16, window, cx))
+            .update(|window, cx| {
+                let zoom = window.zoom();
+                self.handler
+                    .bounds_for_range(range_utf16, window, cx)
+                    .map(|bounds| to_screen(bounds, zoom))
+            })
             .ok()
             .flatten()
     }
@@ -1246,21 +1262,29 @@ impl PlatformInputHandler {
 
     pub fn selected_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
         let selection = self.handler.selected_text_range(true, window, cx)?;
-        self.handler.bounds_for_range(
-            if selection.reversed {
-                selection.range.start..selection.range.start
-            } else {
-                selection.range.end..selection.range.end
-            },
-            window,
-            cx,
-        )
+        let zoom = window.zoom();
+        self.handler
+            .bounds_for_range(
+                if selection.reversed {
+                    selection.range.start..selection.range.start
+                } else {
+                    selection.range.end..selection.range.end
+                },
+                window,
+                cx,
+            )
+            .map(|bounds| to_screen(bounds, zoom))
     }
 
     #[allow(unused)]
     pub fn character_index_for_point(&mut self, point: Point<Pixels>) -> Option<usize> {
         self.cx
-            .update(|window, cx| self.handler.character_index_for_point(point, window, cx))
+            .update(|window, cx| {
+                // Arrives from the platform in the window's own units; the handler
+                // compares it against laid-out text.
+                let point = point / window.zoom();
+                self.handler.character_index_for_point(point, window, cx)
+            })
             .ok()
             .flatten()
     }
