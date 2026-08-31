@@ -10,20 +10,20 @@ use crate::{
     BoxShadow, BrushExtend, Capslock, ClipId, ClipPath, Context, Corners, CursorHideMode,
     CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree,
     DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
-    GlobalElementId, GlyphId, GpuSpecs, Gradient, GradientKey, GroupSpec, Hsla, InputHandler,
-    IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId,
-    LineLayoutIndex, MAX_GRADIENT_CACHE_BYTES, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, PathBrush, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromisedFiles, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, SceneFilter, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
-    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
-    prelude::*, px, rems, size, transparent_black,
+    GlobalElementId, GlyphId, GpuSpecs, Gradient, GradientKey, GroupSpec, Hsla, ImageId,
+    InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    KeystrokeEvent, LayoutId, LineLayoutIndex, MAX_GRADIENT_CACHE_BYTES, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    Path, PathBrush, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromisedFiles, PromptButton, PromptLevel,
+    Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay,
+    ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels,
+    Scene, SceneFilter, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
+    SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
+    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    point, prelude::*, px, rems, size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -1130,9 +1130,12 @@ enum InputModality {
 
 /// One gradient a window has baked into a texture and put in the sprite atlas.
 struct GradientRamp {
-    /// The baked texels. Held so the atlas entry can be removed again under the
-    /// [`RenderImageParams`] its id forms.
-    data: Arc<RenderImage>,
+    /// The id the atlas entry is keyed by, so it can be removed again under the
+    /// [`RenderImageParams`] the id forms. The texels themselves belong to the
+    /// atlas; keeping the `RenderImage` alive here would hold a second copy of
+    /// every baked ramp on the heap, doubling what the cache's own budget says
+    /// it costs.
+    image_id: ImageId,
     /// Where the atlas put them, so a repeat of the same gradient costs a map
     /// lookup rather than an atlas one.
     tile: AtlasTile,
@@ -4745,8 +4748,9 @@ impl Window {
                     DevicePixels(plan.size.width as i32),
                     DevicePixels(plan.size.height as i32),
                 );
+                let image_id = data.id;
                 let params = RenderImageParams {
-                    image_id: data.id,
+                    image_id,
                     frame_index: 0,
                 };
                 let tile = self
@@ -4766,7 +4770,7 @@ impl Window {
                 self.gradient_ramps.insert(
                     plan.key.clone(),
                     GradientRamp {
-                        data,
+                        image_id,
                         tile,
                         bytes,
                         used,
@@ -4841,7 +4845,7 @@ impl Window {
             self.gradient_ramp_bytes -= ramp.bytes;
             self.sprite_atlas.remove(
                 &RenderImageParams {
-                    image_id: ramp.data.id,
+                    image_id: ramp.image_id,
                     frame_index: 0,
                 }
                 .into(),
