@@ -257,6 +257,9 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    /// Whether this renderer has already said that it composites no isolated
+    /// groups. See [`gpui::report_groups_painted_without_isolation`].
+    reported_groups: bool,
 }
 
 impl WgpuRenderer {
@@ -630,6 +633,7 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            reported_groups: false,
         })
     }
 
@@ -1311,6 +1315,8 @@ impl WgpuRenderer {
         if !self.surface_configured {
             return false;
         }
+
+        gpui::report_groups_painted_without_isolation(scene, &mut self.reported_groups);
 
         let last_error = self.last_error.lock().unwrap().take();
         if let Some(error) = last_error {
