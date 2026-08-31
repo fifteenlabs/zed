@@ -52,10 +52,12 @@ pub(crate) use keyboard::*;
 pub(crate) use platform::*;
 pub(crate) use window::*;
 
-#[cfg(feature = "font-kit")]
-pub(crate) use text_system::*;
-
 pub use platform::MacPlatform;
+
+/// Core Text-backed text system. Exported so tests that need real glyph
+/// measurement can build one without standing up a whole `MacPlatform`.
+#[cfg(feature = "font-kit")]
+pub use text_system::MacTextSystem;
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;
