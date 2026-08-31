@@ -8041,6 +8041,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui_render_tests"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "core-foundation 0.10.0",
+ "core-video",
+ "gpui",
+ "gpui_macos",
+ "gpui_platform",
+ "image",
+ "log",
+]
+
+[[package]]
 name = "gpui_shared_string"
 version = "0.1.0"
 dependencies = [

@@ -94,6 +94,7 @@ members = [
     "crates/gpui_macos",
     "crates/gpui_macros",
     "crates/gpui_platform",
+    "crates/gpui_render_tests",
     "crates/gpui_shared_string",
     "crates/gpui_tokio",
     "crates/gpui_util",

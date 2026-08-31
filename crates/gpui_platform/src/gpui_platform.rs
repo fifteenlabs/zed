@@ -81,17 +81,35 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
 }
 
 /// Returns a new [`HeadlessRenderer`] for the current platform, if available.
+///
+/// Its target is cleared to opaque black, like a screenshot of a normal
+/// window. For a target whose alpha is the scene's own coverage, see
+/// [`current_headless_renderer_with_transparency`].
 #[cfg(feature = "test-support")]
 pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
+    current_headless_renderer_with_transparency(false)
+}
+
+/// Returns a new [`HeadlessRenderer`] for the current platform, if available,
+/// clearing its target to transparent rather than to opaque black when
+/// `transparent` is set.
+///
+/// A transparent target is what an assertion about alpha needs: over opaque
+/// black every pixel reads back with an alpha of 255 whatever the scene did.
+#[cfg(feature = "test-support")]
+pub fn current_headless_renderer_with_transparency(
+    transparent: bool,
+) -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
     #[cfg(target_os = "macos")]
     {
         Some(Box::new(
-            gpui_macos::metal_renderer::MetalHeadlessRenderer::new(),
+            gpui_macos::metal_renderer::MetalHeadlessRenderer::with_transparency(transparent),
         ))
     }
 
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = transparent;
         None
     }
 }

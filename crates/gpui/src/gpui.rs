@@ -15,6 +15,7 @@ mod arena;
 mod asset_cache;
 mod assets;
 mod bounds_tree;
+mod clip_path;
 mod color;
 /// The default colors used by GPUI.
 pub mod colors;
@@ -28,6 +29,7 @@ pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
 mod gestures;
 mod global;
+mod gradient;
 mod input;
 mod inspector;
 mod interactive;
@@ -96,6 +98,7 @@ pub use app::*;
 pub(crate) use arena::*;
 pub use asset_cache::*;
 pub use assets::*;
+pub use clip_path::*;
 pub use color::*;
 pub use ctor::ctor;
 #[cfg(feature = "profiler")]
@@ -109,6 +112,7 @@ pub use global::*;
 pub use gpui_macros::{
     AppContext, IntoElement, Render, VisualContext, bench, property_test, register_action, test,
 };
+pub use gradient::*;
 pub use spring::*;
 
 /// Defines a Criterion benchmark group for benchmarks annotated with [`gpui::bench`].
