@@ -10,8 +10,8 @@ use crate::{
     BoxShadow, BrushExtend, Capslock, ClipId, ClipPath, Context, Corners, CursorHideMode,
     CursorStyle, Decorations, DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree,
     DisplayId, Edges, Effect, Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global,
-    GlobalElementId, GlyphId, GpuSpecs, Gradient, GradientKey, GroupSpec, Hsla, ImageId,
-    InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
+    GlobalElementId, GlyphId, GpuSpecs, Gradient, GradientKey, GradientPlan, GroupSpec, Hsla,
+    ImageId, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, MAX_GRADIENT_CACHE_BYTES, Modifiers,
     ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
     Path, PathBrush, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
@@ -1139,8 +1139,10 @@ struct GradientRamp {
     /// Where the atlas put them, so a repeat of the same gradient costs a map
     /// lookup rather than an atlas one.
     tile: AtlasTile,
-    /// What the texture costs, against [`MAX_GRADIENT_CACHE_BYTES`].
-    bytes: usize,
+    /// The flat colour a backend that cannot resolve a brush paints instead:
+    /// see [`Gradient::flat_midpoint`], which is why it is held rather than
+    /// asked for once a frame per path.
+    flat: Hsla,
     /// The value of [`Window::gradient_clock`] when this was last painted.
     used: u64,
 }
@@ -1169,9 +1171,9 @@ pub struct Window {
     /// Ticked once per gradient painted, so the least-recently-used entry can
     /// be found without keeping a list in order.
     gradient_clock: u64,
-    /// When this window last said it could not make room for a gradient, so it
-    /// can say so again later without saying it every frame.
-    gradient_ceiling_warned: Option<std::time::Instant>,
+    /// Whether this window has already said it could not make room for a
+    /// gradient, so it says so once rather than once per gradient per frame.
+    gradient_ceiling_warned: bool,
     /// How many times a gradient has actually been evaluated into a texture.
     ///
     /// Counted rather than derived from the map's length, because the two say
@@ -1890,7 +1892,7 @@ impl Window {
             gradient_ramps: FxHashMap::default(),
             gradient_ramp_bytes: 0,
             gradient_clock: 0,
-            gradient_ceiling_warned: None,
+            gradient_ceiling_warned: false,
             gradient_bakes: 0,
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
@@ -4006,16 +4008,12 @@ impl Window {
     /// Obtain the current content mask. This method should only be called during element drawing.
     pub fn content_mask(&self) -> ContentMask<Pixels> {
         self.invalidator.debug_assert_paint_or_prepaint();
-        self.content_mask_stack
-            .last()
-            .cloned()
-            .unwrap_or_else(|| ContentMask {
-                bounds: Bounds {
-                    origin: Point::default(),
-                    size: self.viewport_size,
-                },
-                ..Default::default()
+        self.content_mask_stack.last().cloned().unwrap_or_else(|| {
+            ContentMask::new(Bounds {
+                origin: Point::default(),
+                size: self.viewport_size,
             })
+        })
     }
 
     /// Provide elements in the called function with a new namespace in which their identifiers must be unique.
@@ -4209,8 +4207,8 @@ impl Window {
     /// it was deferred: it is painted afterwards, at the top level, so it
     /// receives none of that group's opacity, blending or filtering. That
     /// cannot happen through [`Window::with_isolated_group`], which runs in
-    /// the paint phase while this runs in prepaint, and the assertion below
-    /// says so if it ever becomes possible.
+    /// the paint phase while this runs in prepaint - and the phase assertion
+    /// below is what enforces that.
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn defer_draw(
@@ -4221,11 +4219,6 @@ impl Window {
         content_mask: Option<ContentMask<Pixels>>,
     ) {
         self.invalidator.debug_assert_prepaint();
-        debug_assert_eq!(
-            self.next_frame.scene.group_depth(),
-            0,
-            "a draw deferred inside an isolated group escapes it"
-        );
         let parent_node = self.next_frame.dispatch_tree.active_node_id().unwrap();
         self.next_frame.deferred_draws.push(DeferredDraw {
             current_view: self.current_view(),
@@ -4343,7 +4336,14 @@ impl Window {
         opacity: f32,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        self.with_isolated_group(GroupOptions::opacity(bounds, opacity), f)
+        self.with_isolated_group(
+            GroupOptions {
+                bounds,
+                opacity,
+                ..Default::default()
+            },
+            f,
+        )
     }
 
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
@@ -4567,6 +4567,55 @@ impl Window {
         self.next_frame.scene.insert_primitive(path);
     }
 
+    /// The atlas tile holding one frame of `data`, uploading its bytes the
+    /// first time it is asked for.
+    ///
+    /// `size` is that frame's size in device pixels, which every caller has
+    /// already worked out for reasons of its own.
+    fn atlas_tile(
+        &self,
+        data: &RenderImage,
+        frame_index: usize,
+        size: Size<DevicePixels>,
+    ) -> Result<AtlasTile> {
+        Ok(self
+            .sprite_atlas
+            .get_or_insert_with(
+                &RenderImageParams {
+                    image_id: data.id,
+                    frame_index,
+                }
+                .into(),
+                &mut || {
+                    Ok(Some((
+                        size,
+                        Cow::Borrowed(
+                            data.as_bytes(frame_index)
+                                .expect("It's the caller's job to pass a valid frame index"),
+                        ),
+                    )))
+                },
+            )?
+            .expect("Callback above only returns Some"))
+    }
+
+    /// Put a path carrying a brush into the scene: scaled into device pixels,
+    /// masked by whatever is masking the element painting it, and given the
+    /// flat colour a backend that cannot resolve the brush will paint instead.
+    ///
+    /// `flat` arrives already carrying both the caller's `alpha` and the
+    /// element opacity, because the two brushed painters fold them in by
+    /// different routes - an image brush multiplies the two together, while a
+    /// gradient's midpoint has already taken `alpha` - and choosing one of
+    /// those here would quietly change the other.
+    fn insert_brushed_path(&mut self, path: Path<Pixels>, flat: Background, brush: PathBrush) {
+        let mut path = path.scale(self.scale_factor());
+        path.content_mask = self.snapped_content_mask();
+        path.color = flat;
+        path.brush = Some(brush);
+        self.next_frame.scene.insert_primitive(path);
+    }
+
     /// Fill the given `Path` with an image rather than a colour.
     ///
     /// `brush_transform` maps the image's own pixel rectangle - its top-left at
@@ -4623,22 +4672,7 @@ impl Window {
             .invert()
             .context("an image brush transform that collapses the image to a line or a point")?;
 
-        let params = RenderImageParams {
-            image_id: data.id,
-            frame_index,
-        };
-        let tile = self
-            .sprite_atlas
-            .get_or_insert_with(&params.into(), &mut || {
-                Ok(Some((
-                    image_size,
-                    Cow::Borrowed(
-                        data.as_bytes(frame_index)
-                            .expect("It's the caller's job to pass a valid frame index"),
-                    ),
-                )))
-            })?
-            .expect("Callback above only returns Some");
+        let tile = self.atlas_tile(&data, frame_index, image_size)?;
 
         let scale_factor = self.scale_factor();
         // Everything between the fragment being shaded and the texel it reads
@@ -4655,23 +4689,23 @@ impl Window {
                 TransformationMatrix::unit().scale(size(1. / scale_factor, 1. / scale_factor)),
             );
 
-        let content_mask = self.snapped_content_mask();
         let opacity = self.element_opacity();
-        let mut path = path.scale(scale_factor);
-        path.content_mask = content_mask;
         // What a renderer that cannot resolve a brush paints. `Path::color`
         // defaults to a transparent black, so leaving it alone would make a
         // brushed path invisible on wgpu and DirectX rather than merely flat.
-        path.color = crate::solid_background(average_image_color(&data, frame_index, image_size))
+        let flat = crate::solid_background(average_image_color(&data, frame_index, image_size))
             .opacity(alpha * opacity);
-        path.brush = Some(PathBrush {
-            tile,
-            screen_to_brush,
-            x_extend,
-            y_extend,
-            opacity: alpha * opacity,
-        });
-        self.next_frame.scene.insert_primitive(path);
+        self.insert_brushed_path(
+            path,
+            flat,
+            PathBrush {
+                tile,
+                screen_to_brush,
+                x_extend,
+                y_extend,
+                opacity: alpha * opacity,
+            },
+        );
         Ok(())
     }
 
@@ -4725,78 +4759,76 @@ impl Window {
 
         self.gradient_clock += 1;
         let used = self.gradient_clock;
-        let tile = match self.gradient_ramps.get_mut(&plan.key) {
+        let ramp = match self.gradient_ramps.get_mut(&plan.key) {
             Some(ramp) => {
                 ramp.used = used;
-                ramp.tile
+                Some((ramp.tile, ramp.flat))
             }
-            None => {
-                let bytes = plan.key.byte_size();
-                if !self.make_room_for_a_gradient(bytes) {
-                    self.warn_about_the_gradient_bake_ceiling();
-                    self.paint_path(path, gradient.flat_fallback(alpha));
-                    return Ok(());
-                }
-                let buffer = image::RgbaImage::from_raw(
-                    plan.size.width,
-                    plan.size.height,
-                    plan.bake(gradient),
-                )
-                .context("a baked gradient whose bytes do not fill its texture")?;
-                let data = Arc::new(RenderImage::new([image::Frame::new(buffer)]));
-                let image_size = size(
-                    DevicePixels(plan.size.width as i32),
-                    DevicePixels(plan.size.height as i32),
-                );
-                let image_id = data.id;
-                let params = RenderImageParams {
-                    image_id,
-                    frame_index: 0,
-                };
-                let tile = self
-                    .sprite_atlas
-                    .get_or_insert_with(&params.into(), &mut || {
-                        Ok(Some((
-                            image_size,
-                            Cow::Borrowed(
-                                data.as_bytes(0)
-                                    .expect("a baked gradient always has its one frame"),
-                            ),
-                        )))
-                    })?
-                    .expect("Callback above only returns Some");
-                self.gradient_bakes += 1;
-                self.gradient_ramp_bytes += bytes;
-                self.gradient_ramps.insert(
-                    plan.key.clone(),
-                    GradientRamp {
-                        image_id,
-                        tile,
-                        bytes,
-                        used,
-                    },
-                );
-                tile
-            }
+            None => self.bake_gradient_ramp(gradient, &plan, used)?,
+        };
+        let Some((tile, flat)) = ramp else {
+            self.warn_about_the_gradient_bake_ceiling();
+            self.paint_path(path, gradient.flat_fallback(alpha));
+            return Ok(());
         };
 
-        let content_mask = self.snapped_content_mask();
         let opacity = self.element_opacity();
         // The flat colour is what the backends that cannot resolve a brush will
         // paint, and what a `Background` two-stop approximation would have been
         // closest to. On Metal it is never read: the brush replaces the fill.
-        let mut path = path.scale(scale_factor);
-        path.content_mask = content_mask;
-        path.color = gradient.flat_fallback(alpha).opacity(opacity);
-        path.brush = Some(PathBrush {
-            tile,
-            screen_to_brush: plan.screen_to_brush,
-            x_extend: plan.x_extend,
-            y_extend: plan.y_extend,
-            opacity: alpha * opacity,
-        });
-        self.next_frame.scene.insert_primitive(path);
+        self.insert_brushed_path(
+            path,
+            crate::solid_background(flat)
+                .opacity(alpha)
+                .opacity(opacity),
+            PathBrush {
+                tile,
+                screen_to_brush: plan.screen_to_brush,
+                x_extend: plan.x_extend,
+                y_extend: plan.y_extend,
+                opacity: alpha * opacity,
+            },
+        );
         Ok(())
+    }
+
+    /// Evaluate a gradient into a texture, put it in the atlas and record the
+    /// ramp; `None` where the cache could not be given room for it.
+    fn bake_gradient_ramp(
+        &mut self,
+        gradient: &Gradient,
+        plan: &GradientPlan,
+        used: u64,
+    ) -> Result<Option<(AtlasTile, Hsla)>> {
+        let bytes = plan.key.byte_size();
+        if !self.make_room_for_a_gradient(bytes) {
+            return Ok(None);
+        }
+        let texels = plan.size();
+        let buffer = image::RgbaImage::from_raw(texels.width, texels.height, plan.bake(gradient))
+            .context("a baked gradient whose bytes do not fill its texture")?;
+        let data = Arc::new(RenderImage::new([image::Frame::new(buffer)]));
+        let tile = self.atlas_tile(
+            &data,
+            0,
+            size(
+                DevicePixels(texels.width as i32),
+                DevicePixels(texels.height as i32),
+            ),
+        )?;
+        let flat = gradient.flat_midpoint();
+        self.gradient_bakes += 1;
+        self.gradient_ramp_bytes += bytes;
+        self.gradient_ramps.insert(
+            plan.key.clone(),
+            GradientRamp {
+                image_id: data.id,
+                tile,
+                flat,
+                used,
+            },
+        );
+        Ok(Some((tile, flat)))
     }
 
     /// Evict baked gradients until `bytes` more of them fit under
@@ -4842,7 +4874,7 @@ impl Window {
                 .gradient_ramps
                 .remove(&key)
                 .expect("the key came from the map a statement ago");
-            self.gradient_ramp_bytes -= ramp.bytes;
+            self.gradient_ramp_bytes -= key.byte_size();
             self.sprite_atlas.remove(
                 &RenderImageParams {
                     image_id: ramp.image_id,
@@ -4854,27 +4886,20 @@ impl Window {
         true
     }
 
-    /// Says that this window could not make room to bake a gradient, at most
-    /// once a minute.
+    /// Says, once per window, that it could not make room to bake a gradient.
     ///
     /// Beyond this point gradients still paint - as the flat colour their stop
     /// list holds halfway along - so the symptom is a page that goes subtly
     /// flat rather than one that goes blank, which is exactly the kind of thing
     /// that needs saying out loud rather than being left to be noticed. Per
     /// window rather than per process, because a second window hitting the same
-    /// wall is a second thing worth knowing; rate-limited, because it is asked
-    /// once per gradient and a page full of them would otherwise fill a log.
+    /// wall is a second thing worth knowing; once, because it is asked once per
+    /// gradient and a page full of them would otherwise fill a log.
     fn warn_about_the_gradient_bake_ceiling(&mut self) {
-        const EVERY: std::time::Duration = std::time::Duration::from_secs(60);
-
-        let now = std::time::Instant::now();
-        if self
-            .gradient_ceiling_warned
-            .is_some_and(|last| now.duration_since(last) < EVERY)
-        {
+        if self.gradient_ceiling_warned {
             return;
         }
-        self.gradient_ceiling_warned = Some(now);
+        self.gradient_ceiling_warned = true;
         log::warn!(
             "this window is holding {} of baked gradients, every one of them in use in the \
              frame being painted, so it has no room to bake another; further gradients are \
@@ -5232,23 +5257,7 @@ impl Window {
             return Ok(());
         }
 
-        let params = RenderImageParams {
-            image_id: data.id,
-            frame_index,
-        };
-
-        let tile = self
-            .sprite_atlas
-            .get_or_insert_with(&params.into(), &mut || {
-                Ok(Some((
-                    data.size(frame_index),
-                    Cow::Borrowed(
-                        data.as_bytes(frame_index)
-                            .expect("It's the caller's job to pass a valid frame index"),
-                    ),
-                )))
-            })?
-            .expect("Callback above only returns Some");
+        let tile = self.atlas_tile(&data, frame_index, data.size(frame_index))?;
 
         let visible_bounds_snapped = self.snap_bounds(visible_bounds);
 
@@ -7526,17 +7535,6 @@ pub struct GroupOptions {
     /// A filter applied to what is underneath before the subtree is drawn over
     /// it: CSS `backdrop-filter`.
     pub backdrop_filter: Option<SceneFilter>,
-}
-
-impl GroupOptions {
-    /// A group that only fades its subtree.
-    pub fn opacity(bounds: Bounds<Pixels>, opacity: f32) -> Self {
-        Self {
-            bounds,
-            opacity,
-            ..Default::default()
-        }
-    }
 }
 
 impl Default for GroupOptions {
