@@ -521,14 +521,10 @@ impl StickyHeaderLine {
         cx: &mut App,
     ) {
         window.with_content_mask(
-            Some(ContentMask {
-                bounds: Bounds::new(
-                    layout.position_map.text_hitbox.bounds.origin
-                        + point(Pixels::ZERO, self.offset),
-                    size(available_text_width, line_height),
-                ),
-                ..Default::default()
-            }),
+            Some(ContentMask::new(Bounds::new(
+                layout.position_map.text_hitbox.bounds.origin + point(Pixels::ZERO, self.offset),
+                size(available_text_width, line_height),
+            ))),
             |window| {
                 self.line.draw_with_custom_offset(
                     layout,
