@@ -13,8 +13,16 @@ pub struct WgpuContext {
     pub queue: Arc<wgpu::Queue>,
     backend: WgpuBackend,
     dual_source_blending: bool,
+    vertex_storage: bool,
     color_texture_format: wgpu::TextureFormat,
     device_lost: Arc<AtomicBool>,
+}
+
+fn vertex_storage_supported(adapter: &wgpu::Adapter) -> bool {
+    adapter
+        .get_downlevel_capabilities()
+        .flags
+        .contains(wgpu::DownlevelFlags::VERTEX_STORAGE)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,6 +137,7 @@ impl WgpuContext {
         );
 
         let backend = WgpuBackend::Native(adapter.get_info().backend);
+        let vertex_storage = vertex_storage_supported(&adapter);
         Ok(Self {
             instance,
             adapter,
@@ -136,6 +145,7 @@ impl WgpuContext {
             queue: Arc::new(queue),
             backend,
             dual_source_blending,
+            vertex_storage,
             color_texture_format,
             device_lost,
         })
@@ -220,6 +230,7 @@ impl WgpuContext {
             device.limits(),
         );
 
+        let vertex_storage = vertex_storage_supported(&adapter);
         let context = Self {
             instance,
             adapter,
@@ -227,6 +238,7 @@ impl WgpuContext {
             queue: Arc::new(queue),
             backend,
             dual_source_blending,
+            vertex_storage,
             color_texture_format,
             device_lost,
         };
@@ -538,7 +550,7 @@ impl WgpuContext {
     }
 
     pub fn uses_webgl_instance_data(&self) -> bool {
-        matches!(self.backend, WgpuBackend::Gl) && cfg!(target_family = "wasm")
+        !self.vertex_storage
     }
 
     pub fn supports_dual_source_blending(&self) -> bool {
